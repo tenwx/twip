@@ -14,30 +14,36 @@ class twip{
         if(!isset($status->entities)){
             return;
         }
+
+        $shift=0;
         mb_internal_encoding('UTF-8');
 
         if(isset($status->entities->urls)){
-            $a = array_reverse($status->entities->urls);
-            foreach($a as &$url){
+            foreach($status->entities->urls as &$url){
                 if($url->expanded_url){
+                    $url->indices[0] += $shift;
+                    $url->indices[1] += $shift;
                     $status->text = mb_substr($status->text, 0, $url->indices[0]) . $url->expanded_url . mb_substr($status->text, $url->indices[1]);
                     $url->indices[1] = $url->indices[0] + mb_strlen($url->expanded_url);
+                    $diff = mb_strlen($url->expanded_url) - mb_strlen($url->url);
+                    $shift += $diff;
                     $url->url = $url->expanded_url;
                 }
             }
-            $status->entities->urls = array_reverse($a);
         }
 
         if(!isset($status->entities->media)){
             return;
         }
-        $a = array_reverse($status->entities->media);
         foreach($status->entities->media as &$media){
+            $media->indices[0] += $shift;
+            $media->indices[1] += $shift;
             $status->text = mb_substr($status->text, 0, $media->indices[0]) . $media->media_url_https . mb_substr($status->text, $media->indices[1]);
             $media->indices[1] = $media->indices[0] + mb_strlen($media->media_url_https);
+            $diff = mb_strlen($media->media_url_https) - mb_strlen($media->url);
+            $shift += $diff;
             $media->url = $media->media_url_https;
         }
-        $status->entities->media = array_reverse($a);
     }
 
     public function json_x86_decode($in){
@@ -49,12 +55,12 @@ class twip{
         return preg_replace('/id":"(\d+)"/', 'id":\1', $in);
     }
 
-    public function parse_entities($status, $type){
-        if($this->o_mode_parse_entities && $type == 'json'){
+    public function parse_entities($status){
+        if($this->o_mode_parse_entities){
             $j = is_string($status) ? $this->json_x86_decode($status) : $status;
             if(is_array($j)){
                 foreach($j as &$s){
-                    $s = $this->parse_entities($s, $type);
+                    $s = $this->parse_entities($s);
                 }
             }
             else {
@@ -118,17 +124,17 @@ class twip{
     private function parse_variables($options){
         //parse options
         $this->parent_api = isset($options['parent_api']) ? $options['parent_api'] : self::PARENT_API;
-        $this->parent_search_api = isset($options['parent_search_api']) ? $options['parent_search_api'] : self::PARENT_SEARCH_API;
         $this->api_version = isset($options['api_version']) ? $options['api_version'] : self::API_VERSION;
         $this->debug = isset($options['debug']) ? !!$options['debug'] : FALSE;
         $this->dolog = isset($options['dolog']) ? !!$options['dolog'] : FALSE;
         $this->compress = isset($options['compress']) ? !!$options['compress'] : FALSE;
         $this->oauth_key = $options['oauth_key'];
         $this->oauth_secret = $options['oauth_secret'];
+        $this->oauth_key_get = $options['oauth_key_get'];
+        $this->oauth_secret_get = $options['oauth_secret_get'];
         $this->o_mode_parse_entities = isset($options['o_mode_parse_entities']) ? !!$options['o_mode_parse_entities'] : FALSE;
 
         if(substr($this->parent_api, -1) !== '/') $this->parent_api .= '/';
-        if(substr($this->parent_search_api, -1) !== '/') $this->parent_search_api .= '/';
 
         $this->base_url = isset($options['base_url']) ? trim($options['base_url'],'/').'/' : self::BASE_URL;
         if(preg_match('/^https?:\/\//i',$this->base_url) == 0){
@@ -155,6 +161,7 @@ class twip{
         }
         $access_token = unserialize($access_token);
         $this->access_token = $access_token;
+        $this->has_get_token = isset($access_token['oauth_token_get']);
 
         if(preg_match('!oauth/access_token\??!', $this->request_uri)){
             $this->echo_token();
@@ -177,6 +184,7 @@ class twip{
         $this->parameters = $this->get_parameters();
         $this->uri_fixer();
         $this->connection = new TwitterOAuth($this->oauth_key, $this->oauth_secret, $this->access_token['oauth_token'], $this->access_token['oauth_token_secret']);
+        $this->connection_get = $this->has_get_token ? new TwitterOAuth($this->oauth_key_get, $this->oauth_secret_get, $this->access_token['oauth_token_get'], $this->access_token['oauth_token_secret_get']) : $this->connection;
 
 
         // Process with update_with_media
@@ -210,12 +218,6 @@ class twip{
             }
         }
 
-        if(preg_match('/^[^?]+\.json/', $this->request_uri)){
-            $type = 'json';
-        } else {
-            $type = 'xml';
-        }
-
         // Add include_entities arg if not exists and API is configured to expand t.co
         if($this->o_mode_parse_entities && !isset($_REQUEST['include_entities'])){
             if(preg_match('/^[^?]+\?/', $this->request_uri)){
@@ -228,13 +230,10 @@ class twip{
 
         switch($this->method){
             case 'POST':
-                echo $this->parse_entities($this->connection->post($this->request_uri,$this->parameters), $type);
-                break;
-            case 'DELETE':
-                echo $this->parse_entities($this->connection->delete($this->request_uri,$this->parameters), $type);
+                echo $this->parse_entities($this->connection->post($this->request_uri,$this->parameters));
                 break;
             default:
-                echo $this->parse_entities($this->connection->get($this->request_uri), $type);
+                echo $this->parse_entities($this->connection_get->get($this->request_uri));
                 break;
         }
     }
@@ -304,39 +303,23 @@ class twip{
         $this->request_headers['Host'] = 'api.twitter.com';
 
         if($version === "1") {
-            if((strpos($this->request_uri,'search.') === 0)){
-                $this->request_headers['Host'] = 'search.twitter.com';
-            }
-
-            if(strpos($this->request_uri,'statuses/update_with_media') > 0){
-                $this->request_uri = str_replace("api.twitter.com", "upload.twitter.com", $this->request_uri);
-            }
+            header("HTTP/1.0 410 Gone");
+            die();
         }
 
         $replacement = array(
             'pc=true' => 'pc=false', //change pc=true to pc=false
             '&earned=true' => '', //remove "&earned=true"
-            '/1.1/mentions.json' => '/1.1/mentions_timeline.json', //backward compat for API 1.0
-            'i/search.json' => 'search.json', //fix search issue on twitter for iPhone
         );
 
         $api = str_replace(array_keys($replacement), array_values($replacement), $api);
 
-
-        if((strpos($api,'search.') === 0)){
-            $this->request_uri = sprintf("%s%s", $this->parent_search_api, $api);
+        if( strpos($api,'oauth/') === 0 ) {
+            // These API requests don't needs version string
+            $this->request_uri = sprintf("%s%s", $this->parent_api, $api);
+        }else{
+            $this->request_uri = sprintf("%s%s/%s", $this->parent_api, $version, $api);
         }
-        else{
-            if( strpos($api,'oauth/') === 0
-                || strpos($api, 'i/') === 0 ){
-                // These API requests don't needs version string
-                $this->request_uri = sprintf("%s%s", $this->parent_api, $api);
-            }else{
-                $this->request_uri = sprintf("%s%s/%s", $this->parent_api, $version, $api);
-            }
-        }
-
-
     }
 
     public function extract_uri_version($uri){
