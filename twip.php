@@ -1,6 +1,6 @@
 <?php
-require('include/twitteroauth.php');
-require('image_proxy.php');
+require(__ROOT__.'/include/twitteroauth.php');
+require(__ROOT__.'/image_proxy.php');
 class twip{
     const PARENT_API = 'https://api.twitter.com/';
     const PARENT_SEARCH_API = 'http://search.twitter.com/';
@@ -10,6 +10,18 @@ class twip{
     const BASE_URL = 'http://yegle.net/twip/';
     const API_VERSION = '1.1';
 
+    private function push_entities(&$status, &$entities, $type) {
+        if (isset($status->entities->$type)) {
+            foreach($status->entities->$type as &$entity) {
+                $entity->from = $type;
+                array_push($entities, $entity);
+            }
+            $status->entities->$type = array();
+        }
+        if ($type === 'media' && isset($status->extended_entities->$type)) {
+            $status->extended_entities->$type = array();
+        }
+    }
     public function replace_tco_json(&$status){
         if(!isset($status->entities)){
             return;
@@ -18,41 +30,71 @@ class twip{
         $shift=0;
         mb_internal_encoding('UTF-8');
 
-        if(isset($status->entities->urls)){
-            foreach($status->entities->urls as &$url){
-                if($url->expanded_url){
-                    $url->indices[0] += $shift;
-                    $url->indices[1] += $shift;
-                    $status->text = mb_substr($status->text, 0, $url->indices[0]) . $url->expanded_url . mb_substr($status->text, $url->indices[1]);
-                    $url->indices[1] = $url->indices[0] + mb_strlen($url->expanded_url);
-                    $diff = mb_strlen($url->expanded_url) - mb_strlen($url->url);
-                    $shift += $diff;
-                    $url->url = $url->expanded_url;
+        $entities = array();
+        $this->push_entities($status, $entities, 'urls');
+        $this->push_entities($status, $entities, 'media');
+        $this->push_entities($status, $entities, 'symbols');
+        $this->push_entities($status, $entities, 'hashtags');
+        $this->push_entities($status, $entities, 'user_mentions');
+
+        // note that usort is not stable
+        usort($entities, function($a, $b) {
+            return $a->indices[0] - $b->indices[0];
+        });
+
+        $last = -1; // last start
+        $lastlen = 0;
+        $diff = 0;
+        foreach($entities as &$entity){
+            if (isset($entity->media_url_https)) {
+                $newtext = $entity->media_url_https;
+            }
+            elseif (isset($entity->expanded_url)) {
+                $newtext = $entity->expanded_url;
+            }
+            else {
+                $newtext = NULL;
+            }
+            if ($entity->indices[0] === $last) {
+                $entity->indices[0] += $shift - $diff + $lastlen;
+                $entity->indices[1] += $shift - $diff + $lastlen;
+                if ($newtext) {
+                    $status->text = mb_substr($status->text, 0, $entity->indices[0] - 1) . ' ' . $newtext .  mb_substr($status->text, $entity->indices[0] - 1);
+                    $shift += mb_strlen($newtext) + 1;
                 }
             }
-        }
+            else {
+                $last = $entity->indices[0];
+                $entity->indices[0] += $shift;
+                $entity->indices[1] += $shift;
+                if ($newtext) {
+                    $status->text = mb_substr($status->text, 0, $entity->indices[0]) . $newtext . mb_substr($status->text, $entity->indices[1]);
+                    $diff = mb_strlen($newtext) - mb_strlen($entity->url);
+                    $shift += $diff;
+                }
+            }
+            if ($newtext) {
+                $entity->indices[1] = $entity->indices[0] + mb_strlen($newtext);
+                $entity->url = $newtext;
+                $lastlen = mb_strlen($newtext) + 1;
+            }
 
-        if(!isset($status->entities->media)){
-            return;
-        }
-        foreach($status->entities->media as &$media){
-            $media->indices[0] += $shift;
-            $media->indices[1] += $shift;
-            $status->text = mb_substr($status->text, 0, $media->indices[0]) . $media->media_url_https . mb_substr($status->text, $media->indices[1]);
-            $media->indices[1] = $media->indices[0] + mb_strlen($media->media_url_https);
-            $diff = mb_strlen($media->media_url_https) - mb_strlen($media->url);
-            $shift += $diff;
-            $media->url = $media->media_url_https;
+            $from = $entity->from;
+            unset($entity->from);
+            array_push($status->entities->$from, $entity);
+            if ($from === 'media' && isset($status->extended_entities->$from)) {
+                array_push($status->extended_entities->$from, $entity);
+            }
         }
     }
 
     public function json_x86_decode($in){
-        $in = preg_replace('/id":(\d+)/', 'id":"\1"', $in);
+        $in = preg_replace('/id":(\d+)/', 'id":"s\1"', $in);
         return json_decode($in);
     }
     public function json_x86_encode($in){
         $in = json_encode($in);
-        return preg_replace('/id":"(\d+)"/', 'id":\1', $in);
+        return preg_replace('/id":"s(\d+)"/', 'id":\1', $in);
     }
 
     public function parse_entities($status){
@@ -183,7 +225,6 @@ class twip{
         foreach(array('pc', 'earned') as $param) {
             unset($this->parameters[$param]);
         }
-        $this->parameters['include_entities'] = 'true';
         $this->connection = new TwitterOAuth($this->oauth_key, $this->oauth_secret, $this->access_token['oauth_token'], $this->access_token['oauth_token_secret']);
         $this->connection_get = $this->has_get_token ? new TwitterOAuth($this->oauth_key_get, $this->oauth_secret_get, $this->access_token['oauth_token_get'], $this->access_token['oauth_token_secret_get']) : $this->connection;
 
@@ -299,9 +340,13 @@ class twip{
     private function parse_request_uri(){
         // old value
         //$full_request_uri = substr($_SERVER['HTTP_HOST'].$_SERVER['REQUEST_URI'],strlen(preg_replace('/^https?:\/\//i','',$this->base_url)));
-        $full_request_uri = substr(
-            $_SERVER['REQUEST_URI'],
-            strlen(dirname($_SERVER['SCRIPT_NAME'])));
+		if (strlen(dirname($_SERVER['SCRIPT_NAME'])) > 1) {
+			$full_request_uri = substr(
+				$_SERVER['REQUEST_URI'],
+				strlen(dirname($_SERVER['SCRIPT_NAME'])));
+		} else {
+			$full_request_uri = $_SERVER['REQUEST_URI'];
+		}
 
         $prefix = substr($full_request_uri, 0, 3);
         switch($prefix) {
@@ -329,7 +374,7 @@ class twip{
         }
     }
 
-    private function headerfunction($ch,$str){
+    public function headerfunction($ch,$str){
         if(strpos($str,'Content-Length:')!==FALSE){
             header($str);
         }
